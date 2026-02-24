@@ -126,9 +126,9 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx)
 	{
 		char diagbuf[256];
 		int n = snprintf(diagbuf, sizeof(diagbuf),
-			"DIAG segv_handler: sig=%d addr=%p skip=%d valid=%d "
+			"DIAG segv_handler: pid=%d sig=%d addr=%p skip=%d valid=%d "
 			"prog_range=[%p,%p] clone=%d\n",
-			sig, (void*)addr, skip, valid,
+			(int)getpid(), sig, (void*)addr, skip, valid,
 			(void*)prog_start, (void*)prog_end,
 			__atomic_load_n(&clone_ongoing, __ATOMIC_RELAXED));
 		if (n > 0) {
@@ -152,9 +152,12 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx)
 
 static void install_segv_handler(void)
 {
-	// DIAG: confirm handler installation.
-	const char* msg = "DIAG install_segv_handler: installing segv_handler\n";
-	write(2, msg, strlen(msg));
+	// DIAG: confirm handler installation with PID.
+	char msg[128];
+	int msglen = snprintf(msg, sizeof(msg),
+		"DIAG install_segv_handler: pid=%d installing segv_handler\n", (int)getpid());
+	if (msglen > 0)
+		write(2, msg, msglen);
 	{
 		int fd = open("/tmp/syz_segv_diag.log",
 			O_WRONLY | O_CREAT | O_APPEND, 0644);
