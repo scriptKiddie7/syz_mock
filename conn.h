@@ -47,6 +47,136 @@ static bool recv_unpack_active_ = false;
 static const char* recv_unpack_data_ = nullptr;
 static size_t recv_unpack_size_ = 0;
 
+// Decode and dump the internal flatbuffer structure from raw bytes.
+// This is essential for diagnosing UnPackTo failures — it shows the exact
+// union type, vtable layout, and vector lengths that the C++ library will
+// try to allocate during unpacking. No typed accessors are used, so this
+// works even when the buffer is corrupt or misinterpreted.
+// Always available (uses debug(), only prints with -debug flag).
+static void DumpFlatbufferStructure(const char* buf, size_t size)
+{
+	if (size < 8)
+		return;
+	const uint8_t* b = reinterpret_cast<const uint8_t*>(buf);
+
+	// Root offset: first 4 bytes of the buffer.
+	uint32_t root_off = flatbuffers::ReadScalar<uint32_t>(b);
+	debug("  fb: root_offset=%u buf_size=%zu\n", root_off, size);
+	if (root_off + 4 > size) {
+		debug("  fb: ERROR root_offset beyond buffer\n");
+		return;
+	}
+
+	// Root table: starts with signed offset back to vtable.
+	int32_t vtable_soff = flatbuffers::ReadScalar<int32_t>(b + root_off);
+	int64_t vtable_pos = static_cast<int64_t>(root_off) - vtable_soff;
+	debug("  fb: vtable_soff=%d vtable_pos=%lld\n", vtable_soff, (long long)vtable_pos);
+	if (vtable_pos < 0 || static_cast<size_t>(vtable_pos) + 4 > size) {
+		debug("  fb: ERROR vtable_pos out of bounds\n");
+		return;
+	}
+
+	// Vtable: [vtable_size:u16] [table_size:u16] [field_offsets:u16...]
+	uint16_t vtable_size = flatbuffers::ReadScalar<uint16_t>(b + vtable_pos);
+	uint16_t table_size = flatbuffers::ReadScalar<uint16_t>(b + vtable_pos + 2);
+	int num_fields = (vtable_size - 4) / 2;
+	debug("  fb: vtable_size=%u table_size=%u num_fields=%d\n",
+	      vtable_size, table_size, num_fields);
+
+	// Dump root table field offsets.
+	for (int f = 0; f < num_fields && f < 8; f++) {
+		uint16_t foff = flatbuffers::ReadScalar<uint16_t>(
+		    b + vtable_pos + 4 + f * 2);
+		debug("  fb: root_field[%d]: voff=%u", f, foff);
+		if (foff > 0 && root_off + foff + 1 <= size) {
+			// For field[0] of a union table, this is the type byte.
+			uint8_t byte_val = b[root_off + foff];
+			uint32_t u32_val = 0;
+			if (root_off + foff + 4 <= size)
+				u32_val = flatbuffers::ReadScalar<uint32_t>(
+				    b + root_off + foff);
+			debug(" byte=0x%02x u32=0x%08x(%u)", byte_val, u32_val, u32_val);
+		}
+		debug("\n");
+	}
+
+	// For HostMessageRaw: field[0]=union_type (u8), field[1]=union offset (u32).
+	// Try to decode the inner (union) table if present.
+	if (num_fields >= 2) {
+		uint16_t type_voff = flatbuffers::ReadScalar<uint16_t>(
+		    b + vtable_pos + 4);
+		uint16_t union_voff = flatbuffers::ReadScalar<uint16_t>(
+		    b + vtable_pos + 6);
+		if (type_voff == 0 || union_voff == 0)
+			return;
+
+		uint8_t union_type = b[root_off + type_voff];
+		debug("  fb: union_type=%u (%s)\n", union_type,
+		      union_type == 1 ? "ExecRequest" :
+		      union_type == 2 ? "SignalUpdate" :
+		      union_type == 3 ? "CorpusTriaged" :
+		      union_type == 4 ? "StateRequest" : "UNKNOWN");
+
+		if (root_off + union_voff + 4 > size)
+			return;
+		uint32_t inner_rel = flatbuffers::ReadScalar<uint32_t>(
+		    b + root_off + union_voff);
+		uint32_t inner_pos = root_off + union_voff + inner_rel;
+		debug("  fb: inner_table_rel=%u inner_pos=%u\n", inner_rel, inner_pos);
+
+		if (inner_pos + 4 > size)
+			return;
+		int32_t ivt_soff = flatbuffers::ReadScalar<int32_t>(b + inner_pos);
+		int64_t ivt_pos = static_cast<int64_t>(inner_pos) - ivt_soff;
+		if (ivt_pos < 0 || static_cast<size_t>(ivt_pos) + 4 > size)
+			return;
+
+		uint16_t ivt_size = flatbuffers::ReadScalar<uint16_t>(b + ivt_pos);
+		uint16_t it_size = flatbuffers::ReadScalar<uint16_t>(b + ivt_pos + 2);
+		int inner_nfields = (ivt_size - 4) / 2;
+		debug("  fb: inner_vtable_size=%u inner_table_size=%u inner_fields=%d\n",
+		      ivt_size, it_size, inner_nfields);
+
+		// Decode each inner field, try to detect vectors.
+		for (int f = 0; f < inner_nfields && f < 16; f++) {
+			uint16_t foff = flatbuffers::ReadScalar<uint16_t>(
+			    b + ivt_pos + 4 + f * 2);
+			if (foff == 0) {
+				debug("  fb: inner_field[%d]: absent\n", f);
+				continue;
+			}
+			debug("  fb: inner_field[%d]: voff=%u", f, foff);
+			if (inner_pos + foff + 4 <= size) {
+				uint32_t raw_val = flatbuffers::ReadScalar<uint32_t>(
+				    b + inner_pos + foff);
+				debug(" raw=0x%08x(%u)", raw_val, raw_val);
+
+				// Interpret as a vector offset (relative forward ref).
+				// vector_pos = field_pos + raw_val, then [length:u32][data...]
+				uint32_t vec_pos = inner_pos + foff + raw_val;
+				if (raw_val > 0 && raw_val < size &&
+				    vec_pos + 4 <= size &&
+				    vec_pos > inner_pos + foff) {
+					uint32_t vec_len = flatbuffers::ReadScalar<uint32_t>(
+					    b + vec_pos);
+					uint32_t vec_data_end = vec_pos + 4 + vec_len;
+					debug(" → vec_pos=%u vec_len=%u vec_end=%u %s",
+					      vec_pos, vec_len, vec_data_end,
+					      vec_data_end > size ? "OUT_OF_BOUNDS!" : "ok");
+					// For uint64 vectors (SignalUpdate.new_max):
+					uint32_t vec_data_end_u64 = vec_pos + 4 + vec_len * 8;
+					if (vec_len > 1000)
+						debug(" (if_u64: alloc=%u end=%u %s)",
+						      vec_len * 8, vec_data_end_u64,
+						      vec_data_end_u64 > size ?
+						      "OUT_OF_BOUNDS!" : "ok");
+				}
+			}
+			debug("\n");
+		}
+	}
+}
+
 #if SYZ_RPC_DIAG
 // CRC32 (ISO 3309 / ITU-T V.42, same polynomial as zlib / Go's crc32.ChecksumIEEE).
 // Bit-by-bit implementation — no lookup table, compact code.
@@ -136,15 +266,18 @@ public:
 		if (setjmp(recv_unpack_jmpbuf_) != 0) {
 			recv_unpack_active_ = false;
 			if (recv_unpack_data_) {
-				// bad_alloc during UnPackTo — hex dump the corrupt data.
-				char hex[128 * 3 + 1] = {};
-				size_t dump_len = std::min<size_t>(recv_unpack_size_, 128);
+				// bad_alloc during UnPackTo — hex dump + structure decode.
+				char hex[512 * 3 + 1] = {};
+				size_t dump_len = std::min<size_t>(recv_unpack_size_, 512);
 				for (size_t i = 0; i < dump_len; i++)
 					snprintf(hex + i * 3, 4, "%02x ",
 						 static_cast<unsigned char>(recv_unpack_data_[i]));
 				debug("rpc recv: bad_alloc during unpack, skipping corrupt "
 				      "message size=%zu hex=[%s]\n",
 				      recv_unpack_size_, hex);
+				debug("rpc recv: flatbuffer structure of failed message:\n");
+				DumpFlatbufferStructure(recv_unpack_data_,
+							recv_unpack_size_);
 #if SYZ_RPC_DIAG
 				recv_corruption_type_ = kCorruptBadAllocUnpack;
 #endif
@@ -219,6 +352,12 @@ public:
 		}
 		auto raw = flatbuffers::GetRoot<Raw>(recv_buf_.data());
 		debug("rpc recv: size=%u unpacking\n", size);
+		// For large messages, dump flatbuffer structure BEFORE attempting
+		// UnPackTo. This ensures we capture the structure even if UnPackTo
+		// triggers bad_alloc (the longjmp recovery path also dumps, but
+		// having the pre-unpack dump is cleaner and more complete).
+		if (size > 100000)
+			DumpFlatbufferStructure(recv_buf_.data(), size);
 		raw->UnPackTo(&msg);
 		recv_unpack_active_ = false;
 		debug("rpc recv: unpack done\n");
