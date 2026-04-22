@@ -1,0 +1,109 @@
+From: syzkaller per-vm-debug-streams patch
+Subject: vm/device: integrate per-VM DebugSink (file + TCP) under -debug-streams
+
+Wires the device backend into the per-VM debug stream mechanism
+added to vm/vmimpl in the syzkaller fork. When env.DebugStreams is
+set (i.e. syz-manager was launched with -debug-streams), each device
+instance constructs a vmimpl.DebugSink that routes its OutputMerger
+output to:
+
+  - <env.Workdir>/debug/vm-<index>.log  (append-only)
+  - 127.0.0.1:6000+<index>              (TCP listener)
+
+Legacy -debug semantics (tee to os.Stdout, count clamped to 1) are
+preserved unchanged.
+
+Lifetime: the sink is owned by *instance and torn down in Close().
+The existing closeInst defer in pool.ctor (vm/device/device.go:158)
+already calls Close on the partially-constructed instance on error,
+so the Create-failure path is automatically covered.
+
+Apply this patch INSIDE the syz_host repo (not syzkaller).
+Requires the per-vm-debug-streams patch to be applied first in the
+syzkaller repo (so vmimpl.DebugSink, NewDebugSink, DebugSinkOpts,
+DefaultDebugPortBase, and Env.DebugStreams exist).
+
+---
+
+diff --git a/vm/device/device.go b/vm/device/device.go
+--- a/vm/device/device.go
++++ b/vm/device/device.go
+@@ -74,6 +74,13 @@
+ 	forwardPort int
+ 	files       map[string]string
+ 	vmimpl.SSHOptions
++
++	// Per-VM debug sink (file + TCP listener). Non-nil only when
++	// -debug-streams was passed. See vm/vmimpl/debugsink.go.
++	debugStreams bool
++	envName      string // env.Name, for the DebugSink manifest
++	envWorkdir   string // env.Workdir (global), NOT the per-instance workdir
++	debugSink    *vmimpl.DebugSink
+ }
+ 
+ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
+@@ -149,9 +156,12 @@
+ 			Key:  sshkey,
+ 			User: sshuser,
+ 		},
+-		ipaddr:  ip,
+-		dbgport: dbg,
+-		closed:  make(chan bool),
++		ipaddr:       ip,
++		dbgport:      dbg,
++		closed:       make(chan bool),
++		debugStreams: pool.env.DebugStreams,
++		envName:      pool.env.Name,
++		envWorkdir:   pool.env.Workdir,
+ 	}
+ 
+ 	closeInst := inst
+@@ -241,13 +251,34 @@
+ 		log.Logf(0, "device %v: console process started for %v", inst.index, inst.ipaddr)
+ 	}
+ 
+-	// 2. Create merger and add console
++	// 2. Create merger and add console.
++	// When -debug-streams is set, route output to a per-VM DebugSink
++	// (file under <workdir>/debug/vm-<index>.log + TCP listener on
++	// 127.0.0.1:6000+index). Otherwise fall back to legacy -debug
++	// behavior (tee to os.Stdout) or no tee at all.
+ 	var tee io.Writer
+-	if inst.debug {
++	if inst.debugStreams {
++		sink, err := vmimpl.NewDebugSink(vmimpl.DebugSinkOpts{
++			GlobalWorkdir: inst.envWorkdir,
++			VMName:        inst.envName,
++			Index:         inst.index,
++			PortBase:      vmimpl.DefaultDebugPortBase,
++		})
++		if err != nil {
++			log.Logf(0, "device %v: debug sink unavailable: %v", inst.index, err)
++		} else {
++			inst.debugSink = sink
++			tee = sink.Writer()
++			port, path := sink.Endpoint()
++			log.Logf(0, "device %v: debug stream tcp=127.0.0.1:%d log=%s",
++				inst.index, port, path)
++		}
++	} else if inst.debug {
+ 		tee = os.Stdout
+ 	}
+ 	if deviceDebugTrace {
+-		log.Logf(0, "device %v: debug=%v, tee=%v", inst.index, inst.debug, tee != nil)
++		log.Logf(0, "device %v: debug=%v, debugStreams=%v, tee=%v",
++			inst.index, inst.debug, inst.debugStreams, tee != nil)
+ 	}
+ 	inst.merger = vmimpl.NewOutputMerger(tee)
+ 	inst.merger.Add("console", vmimpl.OutputConsole, inst.consoleCmd)
+@@ -479,6 +510,10 @@
+ 	if inst.merger != nil {
+ 		inst.merger.Wait()
+ 	}
++	if inst.debugSink != nil {
++		inst.debugSink.Close()
++		inst.debugSink = nil
++	}
+ 	return nil
+ }
+ 

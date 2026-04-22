@@ -1,0 +1,511 @@
+From: syzkaller merger hardening patch
+Subject: vm/vmimpl: idempotent OutputMerger.Wait + TypedWriter tee dispatch
+
+Two fixes layered on top of the per-vm-debug-streams patch:
+
+Caveat 1 (idempotent Wait):
+  Wrap close(merger.Output) in sync.Once so that Multiplex + Close
+  (or any other pair of callers) can both call Wait without
+  panicking. Latent landmine in device.go's HostFuzzer path if
+  anyone ever passes Console!=nil to Multiplex.
+
+Caveat 2b (typed tee dispatch):
+  Introduce a TypedWriter interface with WriteTyped(typ, name, p).
+  runDecoder type-asserts the tee in NewOutputMerger; when the
+  assertion succeeds, each tee write is routed through WriteTyped
+  with the source name and OutputType. DebugSink implements
+  TypedWriter and prefixes each line with [name] in both file and
+  TCP output. Plain io.Writer tees (os.Stdout, bytes.Buffer) fall
+  through to the legacy Write path unchanged.
+
+Regression audit: qemu/isolated/adb/vmm/starnix/gvisor/virtualbox/
+proxyapp/device.go-legacy all take the plain-Write path (os.Stdout
+and *bytes.Buffer do not implement TypedWriter). Only device.go's
+-debug-streams path (which passes the DebugSink) gets the new
+prefixed behavior.
+
+DebugSink no longer composes io.MultiWriter(file, tcp) in an
+internal `w` field. The sink IS the writer: Writer() returns
+`d` itself, and Write/WriteTyped fan out to file and broadcaster
+in writeBoth.
+
+Tests added:
+  merger_test.go: TestOutputMerger_WaitIdempotent,
+    TestMerger_DispatchesTypedWriter, TestMerger_PlainWriterStillWorks.
+  debugsink_test.go: TestPrefixLines,
+    TestDebugSink_WriteTyped_PrefixesEachLine,
+    TestDebugSink_UntypedWrite_NoPrefix,
+    TestDebugSink_ImplementsTypedWriter.
+
+---
+
+diff --git a/vm/vmimpl/merger.go b/vm/vmimpl/merger.go
+--- a/vm/vmimpl/merger.go
++++ b/vm/vmimpl/merger.go
+@@ -26,6 +26,17 @@
+ 	Type OutputType
+ }
+ 
++// TypedWriter is an optional extension of io.Writer for the merger's tee
++// target. When the value passed to NewOutputMerger implements TypedWriter,
++// runDecoder routes each line to WriteTyped with the originating source
++// name and type — allowing the sink to emit per-source prefixes or
++// otherwise distinguish streams. Tees that are plain io.Writer (e.g.
++// os.Stdout used by legacy -debug backends) keep receiving untyped,
++// prefix-free bytes via their Write method.
++type TypedWriter interface {
++	WriteTyped(typ OutputType, name string, p []byte) (n int, err error)
++}
++
+ type decoderState struct {
+ 	done chan struct{} // Closed when the decoder exits.
+ 	err  error
+@@ -36,7 +47,9 @@
+ 	decoderErr map[string]*decoderState
+ 	teeMu      sync.Mutex
+ 	tee        io.Writer
++	teeTyped   TypedWriter // non-nil iff tee also implements TypedWriter
+ 	wg         sync.WaitGroup
++	waitOnce   sync.Once // guards close(Output) so Wait is idempotent
+ }
+ 
+ type MergerError struct {
+@@ -50,16 +63,26 @@
+ }
+ 
+ func NewOutputMerger(tee io.Writer) *OutputMerger {
+-	return &OutputMerger{
++	m := &OutputMerger{
+ 		Output:     make(chan Chunk, 1000),
+ 		decoderErr: map[string]*decoderState{},
+ 		tee:        tee,
+ 	}
++	if tw, ok := tee.(TypedWriter); ok {
++		m.teeTyped = tw
++	}
++	return m
+ }
+ 
++// Wait blocks until all source goroutines have exited, then closes
++// merger.Output. It is idempotent: only the first call closes the channel,
++// so Multiplex and Close (or any other pair of callers) may both call
++// Wait without panicking.
+ func (merger *OutputMerger) Wait() {
+ 	merger.wg.Wait()
+-	close(merger.Output)
++	merger.waitOnce.Do(func() {
++		close(merger.Output)
++	})
+ }
+ 
+ // Errors returns a channel that will receive errors from the curretly active decoderErr.
+@@ -100,11 +123,22 @@
+ 	go func() {
+ 		defer merger.wg.Done()
+ 		defer close(state.done)
+-		err := merger.runDecoder(typ, r, decoder)
++		err := merger.runDecoder(name, typ, r, decoder)
+ 		state.err = MergerError{name, r, err}
+ 	}()
+ }
+-func (merger *OutputMerger) runDecoder(typ OutputType, r io.ReadCloser,
++
++// teeWrite dispatches to the typed tee if available, else the plain
++// io.Writer. Must be called with merger.teeMu held.
++func (merger *OutputMerger) teeWrite(name string, typ OutputType, p []byte) {
++	if merger.teeTyped != nil {
++		merger.teeTyped.WriteTyped(typ, name, p)
++		return
++	}
++	merger.tee.Write(p)
++}
++
++func (merger *OutputMerger) runDecoder(name string, typ OutputType, r io.ReadCloser,
+ 	decoder func(data []byte) (start, size int, decoded []byte)) error {
+ 	var pending []byte
+ 	var proto []byte
+@@ -130,7 +164,7 @@
+ 				out := pending[:pos+1]
+ 				if merger.tee != nil {
+ 					merger.teeMu.Lock()
+-					merger.tee.Write(out)
++					merger.teeWrite(name, typ, out)
+ 					merger.teeMu.Unlock()
+ 				}
+ 				select {
+@@ -146,7 +180,7 @@
+ 				pending = append(pending, '\n')
+ 				if merger.tee != nil {
+ 					merger.teeMu.Lock()
+-					merger.tee.Write(pending)
++					merger.teeWrite(name, typ, pending)
+ 					merger.teeMu.Unlock()
+ 				}
+ 				select {
+diff --git a/vm/vmimpl/merger_test.go b/vm/vmimpl/merger_test.go
+--- a/vm/vmimpl/merger_test.go
++++ b/vm/vmimpl/merger_test.go
+@@ -7,7 +7,9 @@
+ 	"bytes"
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -146,3 +148,137 @@
+ 	wHang.Close()
+ 	merger.Wait()
+ }
++
++// TestOutputMerger_WaitIdempotent: a second Wait must not panic (the first
++// Wait closes merger.Output; the second should be a no-op). Mirrors the
++// pre-existing double-close landmine in device.go: Multiplex (when given
++// a Console) used to call merger.Wait, and instance.Close also calls it —
++// prior to sync.Once, a second close(Output) would panic.
++func TestOutputMerger_WaitIdempotent(t *testing.T) {
++	// No sources → Wait returns immediately and closes Output.
++	merger := NewOutputMerger(nil)
++	merger.Wait()
++
++	// Second Wait must not panic.
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		merger.Wait()
++	}()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("second Wait did not return within 1s")
++	}
++
++	// Output must be closed.
++	select {
++	case _, ok := <-merger.Output:
++		if ok {
++			t.Fatal("Output receive returned ok=true on a Wait'd merger")
++		}
++	default:
++		t.Fatal("receive on closed channel should not block")
++	}
++}
++
++// testTypedSink is a TypedWriter for merger tests. It records both typed
++// and untyped writes so we can verify the merger dispatches correctly.
++type testTypedSink struct {
++	mu      sync.Mutex
++	typed   bytes.Buffer
++	untyped bytes.Buffer
++}
++
++func (t *testTypedSink) Write(p []byte) (int, error) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.untyped.Write(p)
++}
++
++func (t *testTypedSink) WriteTyped(typ OutputType, name string, p []byte) (int, error) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return fmt.Fprintf(&t.typed, "[%s/%d] %s", name, typ, p)
++}
++
++func (t *testTypedSink) snapshot() (typed, untyped string) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.typed.String(), t.untyped.String()
++}
++
++// TestMerger_DispatchesTypedWriter: when the tee implements TypedWriter,
++// runDecoder must call WriteTyped with the source name + type, NOT
++// Write. Plain io.Writer tees (bytes.Buffer, os.Stdout) must continue to
++// receive untyped Write calls (covered by the pre-existing TestMerger).
++func TestMerger_DispatchesTypedWriter(t *testing.T) {
++	sink := &testTypedSink{}
++	merger := NewOutputMerger(sink)
++
++	rp, wp, err := osutil.LongPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	merger.Add("source-a", OutputStdout, rp)
++
++	wp.Write([]byte("hello\nworld\n"))
++
++	// Drain two chunks (the merger emits whole lines).
++	deadline := time.Now().Add(time.Second)
++	for time.Now().Before(deadline) {
++		typed, _ := sink.snapshot()
++		if typed == "[source-a/1] hello\n[source-a/1] world\n" {
++			break
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	typed, untyped := sink.snapshot()
++	if typed != "[source-a/1] hello\n[source-a/1] world\n" {
++		t.Fatalf("typed sink got %q, want per-line prefixes", typed)
++	}
++	if untyped != "" {
++		t.Fatalf("typed-capable sink received untyped Write: %q", untyped)
++	}
++
++	wp.Close()
++	// Drain output channel so Wait can close it.
++	go func() {
++		for range merger.Output {
++		}
++	}()
++	merger.Wait()
++}
++
++// TestMerger_PlainWriterStillWorks: a bytes.Buffer (no TypedWriter)
++// must keep receiving untyped, unprefixed Writes. Regression guard for
++// qemu/isolated/adb/etc. backends that pass os.Stdout.
++func TestMerger_PlainWriterStillWorks(t *testing.T) {
++	tee := new(bytes.Buffer)
++	merger := NewOutputMerger(tee)
++
++	rp, wp, err := osutil.LongPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	merger.Add("any-name", OutputConsole, rp)
++
++	wp.Write([]byte("plain\n"))
++	deadline := time.Now().Add(time.Second)
++	for time.Now().Before(deadline) {
++		if tee.String() == "plain\n" {
++			break
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	if got := tee.String(); got != "plain\n" {
++		t.Fatalf("plain-writer tee got %q, want %q (unprefixed)", got, "plain\n")
++	}
++
++	wp.Close()
++	go func() {
++		for range merger.Output {
++		}
++	}()
++	merger.Wait()
++}
+diff --git a/vm/vmimpl/debugsink.go b/vm/vmimpl/debugsink.go
+--- a/vm/vmimpl/debugsink.go
++++ b/vm/vmimpl/debugsink.go
+@@ -31,6 +31,7 @@
+ package vmimpl
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -71,13 +72,13 @@
+ 	PortBase int
+ }
+ 
+-// DebugSink owns one append-only log file and one TCP listener. Its single
+-// io.Writer (via Writer()) is intended to be passed to NewOutputMerger as
+-// the tee target.
++// DebugSink owns one append-only log file and one TCP listener. The sink
++// itself is both an io.Writer (untyped passthrough) and a vmimpl.TypedWriter
++// (prefix each line with "[<name>] "); pass it to NewOutputMerger via
++// Writer() and the merger will pick the typed path automatically.
+ type DebugSink struct {
+ 	file io.WriteCloser  // wrapped with onceFileWriter; may be nil if open failed
+ 	tcp  *TCPBroadcaster // may be nil if listener init failed
+-	w    io.Writer       // composed writer passed to merger
+ 
+ 	name  string
+ 	index int
+@@ -131,22 +132,76 @@
+ 		return nil, errors.New("both file and TCP listener failed")
+ 	}
+ 
+-	switch {
+-	case d.file != nil && d.tcp != nil:
+-		d.w = io.MultiWriter(d.file, d.tcp)
+-	case d.file != nil:
+-		d.w = d.file
+-	default:
+-		d.w = d.tcp
+-	}
+-
+ 	debugRegistry.register(d, opts.GlobalWorkdir)
+ 	return d, nil
+ }
+ 
+-// Writer returns the io.Writer to pass as the tee target to NewOutputMerger.
+-func (d *DebugSink) Writer() io.Writer { return d.w }
++// Writer returns this sink as an io.Writer. The returned value also
++// implements vmimpl.TypedWriter, which the merger detects via type
++// assertion and uses for per-source prefixing.
++func (d *DebugSink) Writer() io.Writer { return d }
+ 
++// Write implements io.Writer. Used by the merger when no TypedWriter is
++// detected (not the case for DebugSink since it implements TypedWriter,
++// but Write is exposed so direct callers — e.g. tests — can still write
++// raw bytes without a source name).
++func (d *DebugSink) Write(p []byte) (int, error) {
++	return d.writeBoth(p)
++}
++
++// WriteTyped implements vmimpl.TypedWriter. Each line in p is prefixed
++// with "[<name>] " before being broadcast to the file and TCP clients.
++// Caller (merger.runDecoder, under merger.teeMu) passes line-aligned
++// chunks ending in '\n', though we tolerate a trailing partial line.
++func (d *DebugSink) WriteTyped(typ OutputType, name string, p []byte) (int, error) {
++	return d.writeBoth(prefixLines(p, name))
++}
++
++// writeBoth writes p to the file (if open) and the TCP broadcaster (if
++// listening). Per-writer errors are handled internally (onceFileWriter
++// log-and-swallow for file; non-blocking channel send for TCP) so this
++// never returns a short write.
++func (d *DebugSink) writeBoth(p []byte) (int, error) {
++	if d.file != nil {
++		_, _ = d.file.Write(p)
++	}
++	if d.tcp != nil {
++		_, _ = d.tcp.Write(p)
++	}
++	return len(p), nil
++}
++
++// prefixLines returns a new buffer with "[name] " prepended to every line
++// in p. Handles multi-line chunks and trailing partial lines. Zero-copy
++// fast path for empty input.
++func prefixLines(p []byte, name string) []byte {
++	if len(p) == 0 {
++		return nil
++	}
++	prefix := make([]byte, 0, len(name)+3)
++	prefix = append(prefix, '[')
++	prefix = append(prefix, name...)
++	prefix = append(prefix, ']', ' ')
++	lineCount := bytes.Count(p, []byte{'\n'})
++	if p[len(p)-1] != '\n' {
++		lineCount++ // trailing partial line (no newline)
++	}
++	out := make([]byte, 0, len(p)+lineCount*len(prefix))
++	start := 0
++	for i := 0; i < len(p); i++ {
++		if p[i] == '\n' {
++			out = append(out, prefix...)
++			out = append(out, p[start:i+1]...)
++			start = i + 1
++		}
++	}
++	if start < len(p) {
++		out = append(out, prefix...)
++		out = append(out, p[start:]...)
++	}
++	return out
++}
++
+ // Endpoint returns the listening port (0 if TCP unavailable) and absolute
+ // log file path ("" if file unavailable).
+ func (d *DebugSink) Endpoint() (port int, path string) {
+diff --git a/vm/vmimpl/debugsink_test.go b/vm/vmimpl/debugsink_test.go
+--- a/vm/vmimpl/debugsink_test.go
++++ b/vm/vmimpl/debugsink_test.go
+@@ -108,6 +108,95 @@
+ 	}
+ }
+ 
++// TestPrefixLines exercises the helper directly. Covers empty, single,
++// multi-line, and trailing-partial-line inputs.
++func TestPrefixLines(t *testing.T) {
++	tests := []struct {
++		name, src, want string
++	}{
++		{"empty", "", ""},
++		{"single-line", "hello\n", "[c] hello\n"},
++		{"two-lines", "a\nb\n", "[c] a\n[c] b\n"},
++		{"trailing-partial", "a\npartial", "[c] a\n[c] partial"},
++		{"just-newline", "\n", "[c] \n"},
++		{"no-newline", "partial", "[c] partial"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got := prefixLines([]byte(tc.src), "c")
++			if string(got) != tc.want {
++				t.Fatalf("prefixLines(%q, c) = %q, want %q", tc.src, got, tc.want)
++			}
++		})
++	}
++}
++
++// TestDebugSink_WriteTyped_PrefixesEachLine: WriteTyped must write
++// [name]-prefixed lines to the file and to TCP clients.
++func TestDebugSink_WriteTyped_PrefixesEachLine(t *testing.T) {
++	dir := t.TempDir()
++	s, err := NewDebugSink(DebugSinkOpts{
++		GlobalWorkdir: dir, VMName: "test", Index: 0, PortBase: pickFreePortBase(t),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := s.WriteTyped(OutputConsole, "console", []byte("line1\nline2\n")); err != nil {
++		t.Fatal(err)
++	}
++	_, path := s.Endpoint()
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := "[console] line1\n[console] line2\n"
++	if got := string(data); got != want {
++		t.Fatalf("file = %q, want %q", got, want)
++	}
++}
++
++// TestDebugSink_UntypedWrite_NoPrefix: Writing via the plain io.Writer
++// path (Write, not WriteTyped) must NOT add a prefix. This path is
++// exercised by direct callers (e.g. tests) and by the merger only if
++// the TypedWriter type assertion ever fails.
++func TestDebugSink_UntypedWrite_NoPrefix(t *testing.T) {
++	dir := t.TempDir()
++	s, err := NewDebugSink(DebugSinkOpts{
++		GlobalWorkdir: dir, VMName: "test", Index: 0, PortBase: pickFreePortBase(t),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := s.Write([]byte("raw\n")); err != nil {
++		t.Fatal(err)
++	}
++	_, path := s.Endpoint()
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := string(data); got != "raw\n" {
++		t.Fatalf("file = %q, want %q (no prefix on untyped Write)", got, "raw\n")
++	}
++}
++
++// TestDebugSink_ImplementsTypedWriter: compile-time check that DebugSink
++// satisfies the TypedWriter interface. If this ever breaks, the merger
++// will silently fall back to untyped Write and prefixes will vanish.
++func TestDebugSink_ImplementsTypedWriter(t *testing.T) {
++	var _ TypedWriter = (*DebugSink)(nil)
++}
++
+ // TestDebugSink_FileAppendsAcrossOpens: opening, writing, closing, then
+ // reopening with the same opts must yield a file containing both writes.
+ func TestDebugSink_FileAppendsAcrossOpens(t *testing.T) {
