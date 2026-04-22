@@ -1,0 +1,870 @@
+From: syzkaller per-vm-debug-streams patch
+Subject: vm: per-VM debug streams (file + TCP) for multi-device debug runs
+
+Adds a -debug-streams flag to syz-manager that routes each VM's
+OutputMerger output to a per-VM log file under <workdir>/debug/
+and a per-VM TCP listener on 127.0.0.1:6000+index, instead of
+the legacy shared os.Stdout tee. Unlike -debug, the new flag
+does NOT clamp count=1, so multiple devices/VMs can run in
+parallel while keeping per-device debug visibility.
+
+See per-vm-debug-streams.analysis for design notes.
+
+---
+
+diff --git a/vm/vm.go b/vm/vm.go
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -111,32 +111,56 @@
+ 	return vmimpl.Types[vmType(typ)].Overcommit
+ }
+ 
++// CreateOptions configures a VM pool. Use Create for the legacy single-bool
++// API; use CreateWithOptions when you need DebugStreams (per-VM file + TCP
++// debug streams that don't clamp count to 1).
++type CreateOptions struct {
++	// Debug is the legacy debug flag: backends tee VM output to os.Stdout
++	// and the count is clamped to 1 to keep the shared stream readable.
++	Debug bool
++	// DebugStreams routes each VM's output to its own log file plus a
++	// localhost TCP listener (see vm/vmimpl/debugsink.go). When set, count
++	// is NOT clamped. Backends choose between Debug (os.Stdout) and
++	// DebugStreams (DebugSink) at instance construction time.
++	DebugStreams bool
++}
++
+ // Create creates a VM pool that can be used to create individual VMs.
++// Equivalent to CreateWithOptions(cfg, CreateOptions{Debug: debug}).
+ func Create(cfg *mgrconfig.Config, debug bool) (*Pool, error) {
++	return CreateWithOptions(cfg, CreateOptions{Debug: debug})
++}
++
++// CreateWithOptions is the option-struct form of Create. Use this when you
++// need to enable DebugStreams.
++func CreateWithOptions(cfg *mgrconfig.Config, opts CreateOptions) (*Pool, error) {
+ 	typ, ok := vmimpl.Types[vmType(cfg.Type)]
+ 	if !ok {
+ 		return nil, fmt.Errorf("unknown instance type '%v'", cfg.Type)
+ 	}
+ 	env := &vmimpl.Env{
+-		Name:      cfg.Name,
+-		OS:        cfg.TargetOS,
+-		Arch:      cfg.TargetVMArch,
+-		Workdir:   cfg.Workdir,
+-		Image:     cfg.Image,
+-		SSHKey:    cfg.SSHKey,
+-		SSHUser:   cfg.SSHUser,
+-		Timeouts:  cfg.Timeouts,
+-		Snapshot:  cfg.Snapshot,
+-		Debug:     debug,
+-		Config:    cfg.VM,
+-		KernelSrc: cfg.KernelSrc,
++		Name:         cfg.Name,
++		OS:           cfg.TargetOS,
++		Arch:         cfg.TargetVMArch,
++		Workdir:      cfg.Workdir,
++		Image:        cfg.Image,
++		SSHKey:       cfg.SSHKey,
++		SSHUser:      cfg.SSHUser,
++		Timeouts:     cfg.Timeouts,
++		Snapshot:     cfg.Snapshot,
++		Debug:        opts.Debug || opts.DebugStreams,
++		DebugStreams: opts.DebugStreams,
++		Config:       cfg.VM,
++		KernelSrc:    cfg.KernelSrc,
+ 	}
+ 	impl, err := typ.Ctor(env)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	count := impl.Count()
+-	if debug && count > 1 {
++	// Legacy -debug clamps count to 1 to avoid stdout interleaving across
++	// instances. -debug-streams uses per-VM sinks so multiple VMs are fine.
++	if opts.Debug && !opts.DebugStreams && count > 1 {
+ 		log.Logf(0, "limiting number of VMs from %v to 1 in debug mode", count)
+ 		count = 1
+ 	}
+diff --git a/vm/vmimpl/vmimpl.go b/vm/vmimpl/vmimpl.go
+--- a/vm/vmimpl/vmimpl.go
++++ b/vm/vmimpl/vmimpl.go
+@@ -86,6 +86,11 @@
+ 	Debug     bool
+ 	Config    []byte // json-serialized VM-type-specific config
+ 	KernelSrc string
++
++	// DebugStreams, when true, requests that backends route per-VM console
++	// output to a vmimpl.DebugSink (per-VM log file + per-VM TCP listener)
++	// instead of the legacy shared os.Stdout tee. See vm/vmimpl/debugsink.go.
++	DebugStreams bool
+ }
+ 
+ // BootError is returned by Pool.Create when VM does not boot.
+diff --git a/syz-manager/manager.go b/syz-manager/manager.go
+--- a/syz-manager/manager.go
++++ b/syz-manager/manager.go
+@@ -56,6 +56,10 @@
+ var (
+ 	flagConfig  = flag.String("config", "", "configuration file")
+ 	flagDebug   = flag.Bool("debug", false, "dump all VM output to console")
++	flagDebugStreams = flag.Bool("debug-streams", false,
++		"per-VM debug streams: each VM gets its own log file under <workdir>/debug/ "+
++			"and a TCP listener on 127.0.0.1:6000+index. Does NOT clamp count to 1. "+
++			"Implies -debug verbosity for the executor and RPC server.")
+ 	flagBench   = flag.String("bench", "", "write execution statistics into this file periodically")
+ 	flagMode    = flag.String("mode", ModeFuzzing.Name, modesDescription())
+ 	flagTests   = flag.String("tests", "", "prefix to match test file names (for -mode run-tests)")
+@@ -271,7 +275,10 @@
+ 	var vmPool *vm.Pool
+ 	if !cfg.VMLess {
+ 		var err error
+-		vmPool, err = vm.Create(cfg, *flagDebug)
++		vmPool, err = vm.CreateWithOptions(cfg, vm.CreateOptions{
++			Debug:        *flagDebug,
++			DebugStreams: *flagDebugStreams,
++		})
+ 		if err != nil {
+ 			log.Fatalf("%v", err)
+ 		}
+@@ -304,7 +311,7 @@
+ 		saturatedCalls:     make(map[string]bool),
+ 		reportGenerator:    manager.ReportGeneratorCache(cfg),
+ 	}
+-	if *flagDebug {
++	if *flagDebug || *flagDebugStreams {
+ 		mgr.cfg.Procs = 1
+ 	}
+ 	mgr.http = &manager.HTTPServer{
+@@ -327,7 +334,7 @@
+ 		Config:  mgr.cfg,
+ 		Manager: mgr,
+ 		Stats:   mgr.servStats,
+-		Debug:   *flagDebug,
++		Debug:   *flagDebug || *flagDebugStreams,
+ 	}
+ 	mgr.serv, err = rpcserver.New(rpcCfg)
+ 	if err != nil {
+@@ -1201,7 +1208,7 @@
+ 	statSyscalls.Add(len(enabledSyscalls))
+ 	candidates := mgr.loadCorpus(enabledSyscalls)
+ 	mgr.setPhaseLocked(phaseLoadedCorpus)
+-	opts := fuzzer.DefaultExecOpts(mgr.cfg, features, *flagDebug)
++	opts := fuzzer.DefaultExecOpts(mgr.cfg, features, *flagDebug || *flagDebugStreams)
+ 
+ 	switch mgr.mode {
+ 	case ModeFuzzing, ModeCorpusTriage:
+@@ -1275,7 +1282,7 @@
+ 			},
+ 			LogFunc: func(text string) { fmt.Println(text) },
+ 			Verbose: true,
+-			Debug:   *flagDebug,
++			Debug:   *flagDebug || *flagDebugStreams,
+ 			Tests:   *flagTests,
+ 		}
+ 		ctx.Init()
+diff --git a/vm/vmimpl/debugsink.go b/vm/vmimpl/debugsink.go
+new file mode 100644
+--- /dev/null
++++ b/vm/vmimpl/debugsink.go
+@@ -0,0 +1,397 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++// DebugSink: per-VM debug stream destination.
++//
++// When syz-manager is run with -debug-streams, each VM/device instance gets
++// its own DebugSink which is passed to NewOutputMerger as the tee target.
++// The sink fans every line out to two destinations:
++//
++//   1. An append-only log file at <workdir>/debug/vm-<index>.log. The file
++//      uses O_APPEND so console history survives Pool.Create cycles
++//      (e.g. across device reboots).
++//
++//   2. A localhost TCP listener on 127.0.0.1:<base+index> (default base
++//      6000, falling back to an ephemeral port if the preferred one is
++//      busy). Any number of clients (PuTTY, TeraTerm, ncat) can attach
++//      and receive the live stream.
++//
++// Sink lifetime is owned by the backend Instance, NOT by the OutputMerger
++// (the merger only ever calls Write on its tee, never Close). This lets
++// the file and listener persist across multiple Run() calls within the
++// same Instance.
++//
++// Critical invariant: TCPBroadcaster.Write performs no I/O. It copies the
++// caller's buffer (because OutputMerger.runDecoder reuses its `pending`
++// slice), takes a mutex, performs O(N_clients) non-blocking channel sends,
++// and returns. Slow clients are silently dropped when their per-client
++// queue fills. This guarantees runDecoder cannot stall on tee, which
++// would otherwise risk a spurious noOutputCrash.
++
++package vmimpl
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"sort"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/google/syzkaller/pkg/log"
++	"github.com/google/syzkaller/pkg/osutil"
++)
++
++// DefaultDebugPortBase is the default TCP base port for per-VM debug streams.
++// Each VM index adds to this base: VM 0 listens on 6000, VM 1 on 6001, etc.
++const DefaultDebugPortBase = 6000
++
++// tcpClientQueueSize bounds memory per connected client. Lines exceeding
++// this queue cause the slow client to be dropped.
++const tcpClientQueueSize = 128
++
++// tcpWriteDeadline bounds how long a single conn.Write may stall before the
++// client is considered dead.
++const tcpWriteDeadline = 2 * time.Second
++
++// DebugSinkOpts configures a per-VM debug sink.
++type DebugSinkOpts struct {
++	// GlobalWorkdir is typically cfg.Workdir; the "debug/" subdir lives here.
++	GlobalWorkdir string
++	// VMName is env.Name; recorded in the manifest only.
++	VMName string
++	// Index is the VM index; determines TCP port and log file name.
++	Index int
++	// PortBase: 0 means use DefaultDebugPortBase.
++	PortBase int
++}
++
++// DebugSink owns one append-only log file and one TCP listener. Its single
++// io.Writer (via Writer()) is intended to be passed to NewOutputMerger as
++// the tee target.
++type DebugSink struct {
++	file io.WriteCloser  // wrapped with onceFileWriter; may be nil if open failed
++	tcp  *TCPBroadcaster // may be nil if listener init failed
++	w    io.Writer       // composed writer passed to merger
++
++	name  string
++	index int
++	port  int    // chosen port (0 if TCP unavailable)
++	path  string // absolute log file path ("" if file unavailable)
++
++	closeOnce sync.Once
++	closeErr  error
++}
++
++// NewDebugSink opens the per-VM log file and TCP listener. Returns an error
++// only if BOTH fail; if just one fails, the sink degrades gracefully.
++func NewDebugSink(opts DebugSinkOpts) (*DebugSink, error) {
++	portBase := opts.PortBase
++	if portBase == 0 {
++		portBase = DefaultDebugPortBase
++	}
++	debugDir := filepath.Join(opts.GlobalWorkdir, "debug")
++	if err := osutil.MkdirAll(debugDir); err != nil {
++		return nil, fmt.Errorf("debug dir: %w", err)
++	}
++
++	d := &DebugSink{name: opts.VMName, index: opts.Index}
++	d.path = filepath.Join(debugDir, fmt.Sprintf("vm-%d.log", opts.Index))
++
++	// File: O_APPEND so history survives Pool.Create cycles.
++	f, ferr := os.OpenFile(d.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if ferr == nil {
++		d.file = newOnceFileWriter(f, d.path)
++	} else {
++		log.Logf(0, "debug sink vm %d: file %s open failed: %v", opts.Index, d.path, ferr)
++		d.path = ""
++	}
++
++	// TCP: try preferred port first; on failure, fall back to ephemeral.
++	preferred := fmt.Sprintf("127.0.0.1:%d", portBase+opts.Index)
++	ln, lerr := net.Listen("tcp", preferred)
++	if lerr != nil {
++		log.Logf(0, "debug sink vm %d: preferred port %s busy (%v); falling back to ephemeral",
++			opts.Index, preferred, lerr)
++		ln, lerr = net.Listen("tcp", "127.0.0.1:0")
++	}
++	if lerr == nil {
++		d.tcp = newTCPBroadcaster(ln)
++		d.port = ln.Addr().(*net.TCPAddr).Port
++	} else {
++		log.Logf(0, "debug sink vm %d: TCP listener failed: %v", opts.Index, lerr)
++	}
++
++	if d.file == nil && d.tcp == nil {
++		return nil, errors.New("both file and TCP listener failed")
++	}
++
++	switch {
++	case d.file != nil && d.tcp != nil:
++		d.w = io.MultiWriter(d.file, d.tcp)
++	case d.file != nil:
++		d.w = d.file
++	default:
++		d.w = d.tcp
++	}
++
++	debugRegistry.register(d, opts.GlobalWorkdir)
++	return d, nil
++}
++
++// Writer returns the io.Writer to pass as the tee target to NewOutputMerger.
++func (d *DebugSink) Writer() io.Writer { return d.w }
++
++// Endpoint returns the listening port (0 if TCP unavailable) and absolute
++// log file path ("" if file unavailable).
++func (d *DebugSink) Endpoint() (port int, path string) {
++	return d.port, d.path
++}
++
++// Close is idempotent. Releases the TCP listener, drains client writers,
++// and closes the file.
++func (d *DebugSink) Close() error {
++	d.closeOnce.Do(func() {
++		debugRegistry.unregister(d)
++		if d.tcp != nil {
++			d.closeErr = d.tcp.Close()
++		}
++		if d.file != nil {
++			if err := d.file.Close(); err != nil && d.closeErr == nil {
++				d.closeErr = err
++			}
++		}
++	})
++	return d.closeErr
++}
++
++// onceFileWriter logs the first write error via golog and swallows
++// subsequent ones, so a full disk does not propagate as a tee error
++// nor flood the manager log.
++type onceFileWriter struct {
++	f      *os.File
++	path   string
++	failed atomic.Bool
++}
++
++func newOnceFileWriter(f *os.File, path string) *onceFileWriter {
++	return &onceFileWriter{f: f, path: path}
++}
++
++func (w *onceFileWriter) Write(p []byte) (int, error) {
++	if w.failed.Load() {
++		return len(p), nil
++	}
++	n, err := w.f.Write(p)
++	if err != nil {
++		if w.failed.CompareAndSwap(false, true) {
++			log.Logf(0, "debug sink: write to %s failed (further errors suppressed): %v",
++				w.path, err)
++		}
++		return len(p), nil
++	}
++	return n, nil
++}
++
++func (w *onceFileWriter) Close() error { return w.f.Close() }
++
++// TCPBroadcaster fans every Write out to all connected clients via per-client
++// queues. Write never performs I/O, so it cannot stall the OutputMerger's
++// runDecoder loop. Slow clients are dropped silently when their queue fills.
++type TCPBroadcaster struct {
++	ln      net.Listener
++	mu      sync.Mutex
++	clients []*tcpClient
++	wg      sync.WaitGroup
++	closed  atomic.Bool
++}
++
++type tcpClient struct {
++	conn  net.Conn
++	queue chan []byte
++}
++
++func newTCPBroadcaster(ln net.Listener) *TCPBroadcaster {
++	b := &TCPBroadcaster{ln: ln}
++	b.wg.Add(1)
++	go b.acceptLoop()
++	return b
++}
++
++func (b *TCPBroadcaster) acceptLoop() {
++	defer b.wg.Done()
++	for {
++		conn, err := b.ln.Accept()
++		if err != nil {
++			return // listener closed
++		}
++		c := &tcpClient{conn: conn, queue: make(chan []byte, tcpClientQueueSize)}
++		b.mu.Lock()
++		if b.closed.Load() {
++			b.mu.Unlock()
++			conn.Close()
++			return
++		}
++		b.clients = append(b.clients, c)
++		b.mu.Unlock()
++		b.wg.Add(1)
++		go b.writeLoop(c)
++	}
++}
++
++func (b *TCPBroadcaster) writeLoop(c *tcpClient) {
++	defer b.wg.Done()
++	defer c.conn.Close()
++	for buf := range c.queue {
++		_ = c.conn.SetWriteDeadline(time.Now().Add(tcpWriteDeadline))
++		if _, err := c.conn.Write(buf); err != nil {
++			// Remove ourselves from the broadcaster under mu, then exit.
++			// We do NOT close the queue here: Write's send is non-blocking
++			// (select with default) so it can never deadlock on this queue.
++			// Any in-flight Write that already enqueued before our
++			// removeClient acquired mu has its buffer GC'd along with the
++			// unreferenced client struct after writeLoop returns.
++			b.removeClient(c)
++			return
++		}
++	}
++}
++
++// removeClient atomically removes a client from the broadcaster's list.
++// Called from writeLoop on Write error. After this returns, no further
++// Write call will try to send to this client's queue (Write iterates
++// b.clients under the same mu).
++func (b *TCPBroadcaster) removeClient(target *tcpClient) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	for i, c := range b.clients {
++		if c == target {
++			b.clients = append(b.clients[:i], b.clients[i+1:]...)
++			return
++		}
++	}
++}
++
++// Write is non-blocking. p is copied because the caller (merger.runDecoder)
++// reuses its `pending` buffer.
++func (b *TCPBroadcaster) Write(p []byte) (int, error) {
++	if b.closed.Load() {
++		return len(p), nil
++	}
++	cp := append([]byte(nil), p...)
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	for i := len(b.clients) - 1; i >= 0; i-- {
++		select {
++		case b.clients[i].queue <- cp:
++		default:
++			// Slow client: drop it. Close its queue so its writeLoop
++			// observes range exit and tears the connection down.
++			close(b.clients[i].queue)
++			b.clients = append(b.clients[:i], b.clients[i+1:]...)
++		}
++	}
++	return len(p), nil
++}
++
++// Close releases the listener, closes all live client queues, and waits
++// for all goroutines (acceptLoop + writeLoops) to exit.
++func (b *TCPBroadcaster) Close() error {
++	if !b.closed.CompareAndSwap(false, true) {
++		return nil
++	}
++	err := b.ln.Close()
++	b.mu.Lock()
++	for _, c := range b.clients {
++		// Channel may already be closed if writeLoop drained on error;
++		// guard with recover via defensive send-then-close pattern.
++		safeClose(c.queue)
++	}
++	b.clients = nil
++	b.mu.Unlock()
++	b.wg.Wait()
++	return err
++}
++
++// safeClose closes a channel that may already be closed (no-op in that
++// case). Safer than relying on Close path being the only closer.
++func safeClose(ch chan []byte) {
++	defer func() { _ = recover() }()
++	close(ch)
++}
++
++// debugRegistry is the package-level registry of live DebugSinks. It writes
++// <workdir>/debug/endpoints.json atomically whenever sinks are registered
++// or unregistered, so external tooling (PuTTY profile launcher scripts,
++// dashboards, etc.) can discover live ports and log paths.
++type debugRegistryT struct {
++	mu      sync.Mutex
++	workdir string
++	sinks   map[string]*DebugSink // key: "vm-<index>"
++}
++
++var debugRegistry = &debugRegistryT{sinks: map[string]*DebugSink{}}
++
++func (r *debugRegistryT) register(d *DebugSink, workdir string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.workdir == "" {
++		r.workdir = workdir
++	}
++	r.sinks[fmt.Sprintf("vm-%d", d.index)] = d
++	r.writeManifestLocked()
++}
++
++func (r *debugRegistryT) unregister(d *DebugSink) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	delete(r.sinks, fmt.Sprintf("vm-%d", d.index))
++	r.writeManifestLocked()
++}
++
++type manifestEntry struct {
++	Name  string `json:"name"`
++	Index int    `json:"index"`
++	Port  int    `json:"port"`
++	Log   string `json:"log"`
++}
++
++func (r *debugRegistryT) writeManifestLocked() {
++	if r.workdir == "" {
++		return
++	}
++	dir := filepath.Join(r.workdir, "debug")
++	if err := osutil.MkdirAll(dir); err != nil {
++		log.Logf(0, "debug sink: manifest dir: %v", err)
++		return
++	}
++	final := filepath.Join(dir, "endpoints.json")
++	tmp := final + ".tmp"
++
++	entries := make([]manifestEntry, 0, len(r.sinks))
++	for _, d := range r.sinks {
++		entries = append(entries, manifestEntry{
++			Name: d.name, Index: d.index, Port: d.port, Log: d.path,
++		})
++	}
++	sort.Slice(entries, func(i, j int) bool { return entries[i].Index < entries[j].Index })
++
++	data, err := json.MarshalIndent(entries, "", "  ")
++	if err != nil {
++		log.Logf(0, "debug sink: manifest marshal: %v", err)
++		return
++	}
++	if err := os.WriteFile(tmp, data, 0644); err != nil {
++		log.Logf(0, "debug sink: manifest write: %v", err)
++		return
++	}
++	if err := os.Rename(tmp, final); err != nil {
++		log.Logf(0, "debug sink: manifest rename: %v", err)
++		_ = os.Remove(tmp)
++	}
++}
+diff --git a/vm/vmimpl/debugsink_test.go b/vm/vmimpl/debugsink_test.go
+new file mode 100644
+--- /dev/null
++++ b/vm/vmimpl/debugsink_test.go
+@@ -0,0 +1,299 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package vmimpl
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// TestBroadcaster_DropsSlowClient: a client that never reads must not
++// stall Write. After enough writes, the slow client must be removed.
++func TestBroadcaster_DropsSlowClient(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	b := newTCPBroadcaster(ln)
++	defer b.Close()
++
++	conn, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++
++	if !waitClients(b, 1, time.Second) {
++		t.Fatal("client never registered")
++	}
++
++	payload := bytes.Repeat([]byte("X"), 1024)
++	start := time.Now()
++	for i := 0; i < 10000; i++ {
++		if _, err := b.Write(payload); err != nil {
++			t.Fatalf("Write returned error: %v", err)
++		}
++	}
++	if elapsed := time.Since(start); elapsed > 2*time.Second {
++		t.Fatalf("Write blocked: 10000 writes took %v", elapsed)
++	}
++
++	if !waitClients(b, 0, 5*time.Second) {
++		t.Fatal("slow client was not dropped")
++	}
++}
++
++// TestBroadcaster_CloseDrainsAccept: Close must release the accept loop
++// promptly even if no client is connected.
++func TestBroadcaster_CloseDrainsAccept(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	b := newTCPBroadcaster(ln)
++
++	done := make(chan struct{})
++	go func() {
++		_ = b.Close()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Close did not return within 2s")
++	}
++}
++
++// TestBroadcaster_WriteCopiesBuffer: Write must copy its argument so that
++// the caller (OutputMerger.runDecoder) is free to mutate `pending`
++// immediately after Write returns.
++func TestBroadcaster_WriteCopiesBuffer(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	b := newTCPBroadcaster(ln)
++	defer b.Close()
++
++	conn, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++
++	if !waitClients(b, 1, time.Second) {
++		t.Fatal("client never registered")
++	}
++
++	buf := []byte("hello")
++	if _, err := b.Write(buf); err != nil {
++		t.Fatal(err)
++	}
++	buf[0] = 'X' // mutate caller buffer immediately
++
++	got := make([]byte, 5)
++	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatal(err)
++	}
++	if string(got) != "hello" {
++		t.Fatalf("client received %q, want %q (Write did not copy)", got, "hello")
++	}
++}
++
++// TestDebugSink_FileAppendsAcrossOpens: opening, writing, closing, then
++// reopening with the same opts must yield a file containing both writes.
++func TestDebugSink_FileAppendsAcrossOpens(t *testing.T) {
++	dir := t.TempDir()
++	opts := DebugSinkOpts{GlobalWorkdir: dir, VMName: "test", Index: 0, PortBase: pickFreePortBase(t)}
++
++	s1, err := NewDebugSink(opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s1.Writer().Write([]byte("first\n")); err != nil {
++		t.Fatal(err)
++	}
++	if err := s1.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	s2, err := NewDebugSink(opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s2.Writer().Write([]byte("second\n")); err != nil {
++		t.Fatal(err)
++	}
++	_, path := s2.Endpoint()
++	if err := s2.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := string(data); got != "first\nsecond\n" {
++		t.Fatalf("file = %q, want %q", got, "first\nsecond\n")
++	}
++}
++
++// TestDebugSink_ManifestUpdates: register/unregister must atomically
++// rewrite endpoints.json.
++func TestDebugSink_ManifestUpdates(t *testing.T) {
++	dir := t.TempDir()
++	base := pickFreePortBase(t)
++
++	s0, err := NewDebugSink(DebugSinkOpts{GlobalWorkdir: dir, VMName: "vm-a", Index: 0, PortBase: base})
++	if err != nil {
++		t.Fatal(err)
++	}
++	s1, err := NewDebugSink(DebugSinkOpts{GlobalWorkdir: dir, VMName: "vm-b", Index: 1, PortBase: base})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	manifest := filepath.Join(dir, "debug", "endpoints.json")
++	entries := readManifest(t, manifest)
++	if len(entries) != 2 {
++		t.Fatalf("manifest has %d entries, want 2", len(entries))
++	}
++
++	if err := s0.Close(); err != nil {
++		t.Fatal(err)
++	}
++	entries = readManifest(t, manifest)
++	if len(entries) != 1 || entries[0].Index != 1 {
++		t.Fatalf("after closing s0: entries=%+v", entries)
++	}
++
++	if err := s1.Close(); err != nil {
++		t.Fatal(err)
++	}
++	entries = readManifest(t, manifest)
++	if len(entries) != 0 {
++		t.Fatalf("after closing all, entries=%+v", entries)
++	}
++}
++
++// TestOnceFileWriter_SuppressesRepeatedErrors: once a write fails, the
++// wrapper must swallow subsequent errors silently.
++func TestOnceFileWriter_SuppressesRepeatedErrors(t *testing.T) {
++	f, err := os.CreateTemp(t.TempDir(), "once-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	w := newOnceFileWriter(f, f.Name())
++	f.Close() // force subsequent Writes to fail
++
++	for i := 0; i < 5; i++ {
++		n, err := w.Write([]byte("data"))
++		if err != nil {
++			t.Fatalf("Write %d returned error: %v (should be swallowed)", i, err)
++		}
++		if n != 4 {
++			t.Fatalf("Write %d returned n=%d, want 4", i, n)
++		}
++	}
++	if !w.failed.Load() {
++		t.Fatal("failed flag was not set")
++	}
++}
++
++// TestDebugSink_PortFallbackOnCollision: if the preferred port is busy,
++// NewDebugSink must fall back to an ephemeral port without failing.
++func TestDebugSink_PortFallbackOnCollision(t *testing.T) {
++	dir := t.TempDir()
++	base := pickFreePortBase(t)
++
++	// Hold the preferred port so the sink must fall back.
++	hold, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", itoa(base)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer hold.Close()
++
++	s, err := NewDebugSink(DebugSinkOpts{GlobalWorkdir: dir, VMName: "test", Index: 0, PortBase: base})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer s.Close()
++
++	port, _ := s.Endpoint()
++	if port == 0 {
++		t.Fatal("sink got port 0, expected ephemeral fallback")
++	}
++	if port == base {
++		t.Fatalf("sink got preferred port %d, expected fallback", port)
++	}
++}
++
++// --- helpers ---
++
++func waitClients(b *TCPBroadcaster, want int, timeout time.Duration) bool {
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		b.mu.Lock()
++		n := len(b.clients)
++		b.mu.Unlock()
++		if n == want {
++			return true
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	return false
++}
++
++func pickFreePortBase(t *testing.T) int {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := ln.Addr().(*net.TCPAddr).Port
++	ln.Close()
++	return port
++}
++
++func readManifest(t *testing.T, path string) []manifestEntry {
++	t.Helper()
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read manifest %s: %v", path, err)
++	}
++	var entries []manifestEntry
++	if err := json.Unmarshal(data, &entries); err != nil {
++		t.Fatalf("unmarshal manifest: %v", err)
++	}
++	return entries
++}
++
++func itoa(n int) string {
++	if n == 0 {
++		return "0"
++	}
++	neg := n < 0
++	if neg {
++		n = -n
++	}
++	var buf [20]byte
++	i := len(buf)
++	for n > 0 {
++		i--
++		buf[i] = byte('0' + n%10)
++		n /= 10
++	}
++	if neg {
++		i--
++		buf[i] = '-'
++	}
++	return string(buf[i:])
++}
